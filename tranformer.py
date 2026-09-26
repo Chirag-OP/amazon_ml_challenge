@@ -32,7 +32,7 @@ class CharTokenizer:
     abbreviations, and punctuation/spacing differences common in names/addresses.
     """
 
-    def __init__(self, max_len: int = 64):
+    def __init__(self, max_len: int = 256):
         chars = string.ascii_lowercase + string.digits + " ,.-#/'&"
         self.vocab = {c: i + 2 for i, c in enumerate(chars)}
         self.vocab["<pad>"] = 0
@@ -54,7 +54,7 @@ class CharTokenizer:
 # 2. Positional encoding
 # ---------------------------------------------------------------------------
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 64):
+    def __init__(self, d_model: int, max_len: int = 256):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len).unsqueeze(1).float()
@@ -81,7 +81,7 @@ class FieldEmbeddingTransformer(nn.Module):
         num_layers: int = 2,
         dim_ff: int = 256,
         embed_dim: int = 64,
-        max_len: int = 64,
+        max_len: int = 256,
         pad_idx: int = 0,
         dropout: float = 0.1,
     ):
@@ -116,35 +116,61 @@ class FieldEmbeddingTransformer(nn.Module):
 
 # ---------------------------------------------------------------------------
 # 4. Automatic augmentation -> synthetic positive pairs
+#    Field-specific: names and addresses fail in different ways, so each
+#    gets its own vocabulary of noise and its own transformation odds.
 # ---------------------------------------------------------------------------
-ABBREV_MAP = {
+ADDRESS_ABBREV_MAP = {
     "street": "st", "road": "rd", "avenue": "ave", "apartment": "apt",
     "boulevard": "blvd", "drive": "dr", "lane": "ln", "court": "ct",
     "north": "n", "south": "s", "east": "e", "west": "w",
-    "building": "bldg", "floor": "fl", "limited": "ltd", "company": "co",
+    "building": "bldg", "floor": "fl", "sector": "sec", "colony": "cly",
+}
+
+# legal-entity suffixes commonly dropped, abbreviated, or spelled out
+# differently across datasets for the SAME business
+NAME_SUFFIX_VARIANTS = {
+    "private limited": ["pvt ltd", "pvt. ltd.", "p ltd", ""],
+    "limited": ["ltd", "ltd.", ""],
+    "limited liability partnership": ["llp", ""],
+    "corporation": ["corp", "co", ""],
+    "incorporated": ["inc", "inc.", ""],
+    "company": ["co", "co.", "&co"],
+}
+
+NAME_TOKEN_SWAPS = {
+    "and": "&", "&": "and", "brothers": "bros", "bros": "brothers",
+    "enterprises": "ent", "traders": "trdrs", "industries": "inds",
 }
 
 
-def augment(text: str) -> str:
-    """Produces a plausible alternate way of writing the same field:
-    abbreviation swaps, punctuation drops, a random typo, occasional
-    word-order jitter. Used to synthesize positive pairs for training."""
+def _random_typo(text: str) -> str:
+    if len(text) <= 4:
+        return text
+    pos = random.randint(0, len(text) - 1)
+    return text[:pos] + random.choice(string.ascii_lowercase) + text[pos + 1:]
+
+
+def augment_address(text: str) -> str:
+    """Noise typical of address fields: street-type abbreviations, dropped
+    punctuation, floor/sector shorthand, and word-order jitter (addresses
+    are legitimately written in different word orders across sources)."""
     words = text.lower().split()
     out_words = []
     for w in words:
         core = w.strip(",.#")
-        if random.random() < 0.35 and core in ABBREV_MAP:
-            out_words.append(ABBREV_MAP[core])
+        if random.random() < 0.35 and core in ADDRESS_ABBREV_MAP:
+            out_words.append(ADDRESS_ABBREV_MAP[core])
         else:
             out_words.append(w)
     variant = " ".join(out_words)
 
     if random.random() < 0.3:
         variant = variant.replace(",", "")
-    if random.random() < 0.2 and len(variant) > 4:
-        pos = random.randint(0, len(variant) - 1)
-        variant = variant[:pos] + random.choice(string.ascii_lowercase) + variant[pos + 1:]
-    if random.random() < 0.15 and len(out_words) > 2:
+    if random.random() < 0.2:
+        variant = _random_typo(variant)
+    if random.random() < 0.25 and len(out_words) > 2:
+        # addresses commonly get reordered (house no./street/city order
+        # varies by source) -- allow more shuffling than names
         idx = list(range(len(out_words)))
         random.shuffle(idx)
         variant = " ".join(out_words[i] for i in idx)
@@ -152,10 +178,52 @@ def augment(text: str) -> str:
     return variant
 
 
+def augment_name(text: str) -> str:
+    """Noise typical of business names: legal-suffix variation, '&' vs
+    'and', common word abbreviations. Word ORDER is mostly kept intact --
+    shuffling name tokens usually changes identity rather than just
+    rephrasing it, unlike addresses."""
+    lower = text.lower()
+
+    for full, variants in NAME_SUFFIX_VARIANTS.items():
+        if full in lower and random.random() < 0.5:
+            lower = lower.replace(full, random.choice(variants)).strip()
+            break
+
+    words = lower.split()
+    out_words = []
+    for w in words:
+        core = w.strip(",.")
+        if random.random() < 0.3 and core in NAME_TOKEN_SWAPS:
+            out_words.append(NAME_TOKEN_SWAPS[core])
+        else:
+            out_words.append(w)
+    variant = " ".join(out_words).strip()
+
+    if random.random() < 0.3:
+        variant = variant.replace(",", "").replace(".", "")
+    if random.random() < 0.15:
+        variant = _random_typo(variant)
+
+    return variant if variant else text.lower()
+
+
+def augment(text: str, field_type: str = "address") -> str:
+    """Dispatches to the field-specific augmenter.
+    field_type: 'name' or 'address'."""
+    if field_type == "name":
+        return augment_name(text)
+    return augment_address(text)
+
+
 # ---------------------------------------------------------------------------
 # 5. Training loop (triplet loss: anchor / augmented-positive / negative)
 # ---------------------------------------------------------------------------
-def train(model, tokenizer, corpus, epochs=30, batch_size=32, lr=1e-3, device="cpu"):
+def train(model, tokenizer, corpus, field_type="address", epochs=30, batch_size=32, lr=1e-3, device="cpu"):
+    """field_type: 'name' or 'address' -- selects the augmentation used to
+    build positive pairs. Train a SEPARATE model per field: name noise and
+    address noise are different enough that one shared encoder would learn
+    a blurred compromise rather than being good at either."""
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     triplet_loss_fn = nn.TripletMarginWithDistanceLoss(
@@ -172,7 +240,7 @@ def train(model, tokenizer, corpus, epochs=30, batch_size=32, lr=1e-3, device="c
                 continue
 
             anchors = batch
-            positives = [augment(t) for t in batch]
+            positives = [augment(t, field_type=field_type) for t in batch]
             # naive random negatives; swap in real "known different entity"
             # pairs if you have labels, for cleaner separation
             negatives = [random.choice(corpus) for _ in batch]
